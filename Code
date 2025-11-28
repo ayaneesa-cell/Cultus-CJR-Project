@@ -1,0 +1,268 @@
+# Dataset and preprocessing
+
+import os
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Configuration
+INPUT_WIDTH = 24 * 7        # past 7 days (hourly)
+LABEL_WIDTH = 24            # predict next 24 hours
+SHIFT = LABEL_WIDTH         # horizon shift
+BATCH_SIZE = 256
+BUFFER_SIZE = 4096
+FEATURE_LIMIT = 50          # cap number of features to keep (for speed/memory)
+DECIMAL = ','               # decimal in UCI file
+SEP = ';'
+
+def load_uci_electricity(csv_path='LD2011_2014.csv'):
+    if not os.path.exists(csv_path):
+        print(f"File not found: {csv_path}. Falling back to synthetic data.")
+        return None
+    # UCI file has many columns (clients). Parse datetime index, decimal comma
+    df = pd.read_csv(csv_path, sep=SEP, decimal=DECIMAL, index_col=0, parse_dates=True, low_memory=False)
+    # Resample to hourly (some versions are already hourly, this will standardize)
+    df = df.resample('1H').mean().ffill().bfill()
+    # Optionally limit features to top-N by variance (keeps the most informative series)
+    var = df.var().sort_values(ascending=False)
+    keep_cols = var.index[:min(FEATURE_LIMIT, len(var))]
+    df = df[keep_cols]
+    return df
+
+def make_synthetic_multivariate(n_hours=24*180, n_features=32):
+    t = np.arange(n_hours)
+    # Base components
+    daily = np.sin(2 * np.pi * t / 24)                     # daily seasonality
+    weekly = 0.5 * np.sin(2 * np.pi * t / (24 * 7))        # weekly seasonality
+    trend = 0.0008 * t                                     # slow trend
+    X = []
+    for f in range(n_features):
+        phase = np.random.uniform(0, 2*np.pi)
+        scale = np.random.uniform(0.5, 1.5)
+        noise = np.random.normal(0, 0.05, size=n_hours)
+        series = scale * (daily + weekly) + trend + 0.3*np.sin(0.1*t + phase) + noise
+        X.append(series)
+    arr = np.stack(X, axis=1)  # [n_hours, n_features]
+    idx = pd.date_range('2012-01-01', periods=n_hours, freq='H')
+    return pd.DataFrame(arr, index=idx)
+
+# 1) Try real dataset; 2) fallback to synthetic
+df = load_uci_electricity('LD2011_2014.csv')
+if df is None:
+    df = make_synthetic_multivariate(n_hours=24*365, n_features=32)
+
+# Train/val/test split by time
+n = len(df)
+train_end = int(n * 0.7)
+val_end = int(n * 0.85)
+train_df = df.iloc[:train_end]
+val_df = df.iloc[train_end:val_end]
+test_df = df.iloc[val_end:]
+
+# Scale features (fit on train only)
+scaler = MinMaxScaler()
+train_scaled = scaler.fit_transform(train_df.values)
+val_scaled = scaler.transform(val_df.values)
+test_scaled = scaler.transform(test_df.values)
+
+# Windowing with tf.data
+
+def make_windows(data, input_width, label_width, shift):
+    """
+    Returns a tf.data.Dataset of (inputs, labels).
+    inputs: [input_width, n_features]
+    labels: [label_width, n_features]
+    """
+    total = input_width + shift
+    ds = tf.keras.preprocessing.timeseries_dataset_from_array(
+        data=data,
+        targets=None,
+        sequence_length=total,
+        sequence_stride=1,
+        sampling_rate=1,
+        batch_size=BATCH_SIZE
+    )
+    def split_window(batch):
+        inputs = batch[:, :input_width, :]
+        labels = batch[:, input_width:, :][:,:label_width,:]
+        return inputs, labels
+
+    ds = ds.map(split_window).cache().shuffle(BUFFER_SIZE).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+train_ds = make_windows(train_scaled, INPUT_WIDTH, LABEL_WIDTH, SHIFT)
+val_ds   = make_windows(val_scaled, INPUT_WIDTH, LABEL_WIDTH, SHIFT)
+test_ds  = make_windows(test_scaled, INPUT_WIDTH, LABEL_WIDTH, SHIFT)
+n_features = df.shape[1]
+print(f"Features: {n_features}, Train batches: {len(list(train_ds.take(1)))}")
+
+# Transformer encoder model in TensorFlow
+
+from tensorflow.keras import layers, models
+
+class PositionalEmbedding(layers.Layer):
+    def __init__(self, maxlen, d_model):
+        super().__init__()
+        self.maxlen = maxlen
+        self.d_model = d_model
+        self.embedding = layers.Embedding(input_dim=maxlen, output_dim=d_model)
+
+    def call(self, x):
+        # x: [batch, time, d_model] (we only use time length to build positions)
+        length = tf.shape(x)[1]
+        positions = tf.range(start=0, limit=length, delta=1)
+        pos_embed = self.embedding(positions)  # [time, d_model]
+        return x + pos_embed
+
+class EncoderBlock(layers.Layer):
+    def __init__(self, d_model, num_heads, dff, dropout=0.1, name=None):
+        super().__init__(name=name)
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model, dropout=dropout)
+        self.ffn = models.Sequential([
+            layers.Dense(dff, activation='relu'),
+            layers.Dense(d_model),
+        ])
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop1 = layers.Dropout(dropout)
+        self.drop2 = layers.Dropout(dropout)
+
+    def call(self, x, training=False, return_scores=False):
+        # Self-attention
+        attn_out, attn_scores = self.mha(
+            query=x, value=x, key=x,
+            return_attention_scores=True,
+            training=training
+        )
+        x = self.norm1(x + self.drop1(attn_out, training=training))
+        # Feed-forward
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.drop2(ffn_out, training=training))
+        if return_scores:
+            return x, attn_scores
+        return x
+
+def build_transformer(input_width, n_features, label_width,
+                      d_model=128, num_heads=4, dff=256, num_layers=3, dropout=0.1,
+                      return_attention=False):
+    inputs = layers.Input(shape=(input_width, n_features))
+    # Project features to model dimension
+    x = layers.Dense(d_model)(inputs)
+    x = PositionalEmbedding(maxlen=input_width, d_model=d_model)(x)
+
+    attn_scores_list = []
+    for i in range(num_layers):
+        block = EncoderBlock(d_model, num_heads, dff, dropout, name=f"encoder_block_{i}")
+        if return_attention:
+            x, scores = block(x, return_scores=True)
+            attn_scores_list.append(scores)
+        else:
+            x = block(x)
+
+    # Aggregate time dimension and predict full horizon * features
+    x = layers.GlobalAveragePooling1D()(x)
+    outputs = layers.Dense(label_width * n_features)(x)
+    outputs = layers.Reshape((label_width, n_features))(outputs)
+
+    if return_attention:
+        # Model outputs predictions plus attention scores from each block
+        return models.Model(inputs=inputs, outputs=[outputs] + attn_scores_list, name="transformer_with_attention")
+    else:
+        return models.Model(inputs=inputs, outputs=outputs, name="transformer")
+
+# Primary training model (no attention outputs to keep training simple)
+transformer = build_transformer(INPUT_WIDTH, n_features, LABEL_WIDTH,
+                                d_model=128, num_heads=4, dff=256, num_layers=3, dropout=0.1,
+                                return_attention=False)
+
+transformer.summary()
+
+# Training and evaluation
+# Compile and train
+
+transformer.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                    loss='mae',
+                    metrics=[tf.keras.metrics.MeanSquaredError(name='mse')])
+
+history = transformer.fit(train_ds,
+                          validation_data=val_ds,
+                          epochs=15)
+
+# Evaluate on test set
+test_metrics = transformer.evaluate(test_ds, verbose=0)
+test_mae = test_metrics[0]
+test_mse = test_metrics[1]
+test_rmse = np.sqrt(test_mse)
+print(f"Transformer Test MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
+
+# Quick visual: pick one batch and one feature
+for xb, yb in test_ds.take(1):
+    preds = transformer.predict(xb, verbose=0)
+    # Plot first sample, first feature
+    i, f = 0, 0
+    plt.figure(figsize=(10,4))
+    plt.plot(yb[i,:,f].numpy(), label='true')
+    plt.plot(preds[i,:,f], label='pred')
+    plt.title('Transformer forecast: sample 0, feature 0')
+    plt.legend()
+    plt.show()
+    break
+
+# Interpreting attention weights
+
+# Build attention-enabled model with same hyperparameters
+transformer_attn = build_transformer(INPUT_WIDTH, n_features, LABEL_WIDTH,
+                                     d_model=128, num_heads=4, dff=256, num_layers=3, dropout=0.1,
+                                     return_attention=True)
+
+# Transfer weights (same layer graph order ensures alignment)
+transformer_attn.set_weights(transformer.get_weights())
+
+# Get a batch and run the model to get predictions plus attention maps
+for xb, yb in test_ds.take(1):
+    outputs = transformer_attn.predict(xb, verbose=0)
+    preds = outputs[0]
+    attn_scores = outputs[1:]  # list per encoder block
+    break
+
+print(f"Number of encoder blocks: {len(attn_scores)}")
+# attn_scores[k] has shape [batch, num_heads, time_q, time_k] for self-attention (q=k=input_width)
+
+# Visualize attention of block 0, head 0, sample 0
+block_idx = 0
+head_idx = 0
+sample_idx = 0
+scores = attn_scores[block_idx][sample_idx, head_idx]  # [time, time]
+avg_over_keys = scores.mean(axis=-1)                   # importance per query timestep
+
+plt.figure(figsize=(10,4))
+plt.plot(avg_over_keys, label='attention weight per timestep')
+plt.title('Encoder attention weights (block 0, head 0)')
+plt.xlabel('Input timestep (past hours)')
+plt.legend()
+plt.show()
+
+# LSTM baseline for comparison
+def build_lstm_baseline(input_width, n_features, label_width, units=128):
+    inputs = layers.Input(shape=(input_width, n_features))
+    x = layers.LSTM(units, return_sequences=True)(inputs)
+    x = layers.LSTM(units)(x)
+    x = layers.Dense(label_width * n_features)(x)
+    outputs = layers.Reshape((label_width, n_features))(x)
+    return models.Model(inputs, outputs, name='lstm_baseline')
+
+lstm_model = build_lstm_baseline(INPUT_WIDTH, n_features, LABEL_WIDTH, units=128)
+lstm_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                   loss='mae',
+                   metrics=[tf.keras.metrics.MeanSquaredError(name='mse')])
+
+history_lstm = lstm_model.fit(train_ds, validation_data=val_ds, epochs=10)
+test_metrics_lstm = lstm_model.evaluate(test_ds, verbose=0)
+test_mae_lstm = test_metrics_lstm[0]
+test_rmse_lstm = np.sqrt(test_metrics_lstm[1])
+print(f"LSTM Test MAE: {test_mae_lstm:.4f}, RMSE: {test_rmse_lstm:.4f}")
